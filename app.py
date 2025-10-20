@@ -7,7 +7,7 @@ import sqlite3
 import hashlib
 import re
 from datetime import datetime
-
+import numpy as np
 app = Flask(__name__)
 app.secret_key = '123456789' 
 DATABASE = 'database.sqlite'
@@ -890,9 +890,64 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # get the posts the user has liked/loved
+    user_likes_res = query_db("""
+        SELECT post_id
+        FROM reactions
+        WHERE user_id = ? AND (reaction_type = 'like' OR reaction_type = 'love')
+    """, (user_id,))
+    user_likes = {res['post_id'] for res in user_likes_res} if user_likes_res else set()
 
-    return recommended_posts;
+    # if the user hasn't liked any posts return the 5 newest posts
+    if not user_likes:
+        return query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ? ORDER BY p.created_at DESC LIMIT 5
+        ''', (user_id,))
+
+    # if filter_following is true then only get recommended posts from followings 
+    if filter_following:
+        shared_posts_res = query_db("""
+            SELECT DISTINCT r.post_id
+            FROM reactions r
+            JOIN follows f ON r.user_id = f.followed_id
+            WHERE (r.reaction_type = 'like' OR r.reaction_type = 'love')
+              AND r.post_id NOT IN (
+                  SELECT post_id
+                  FROM reactions
+                  WHERE user_id = ?
+                    AND (reaction_type = 'like' OR reaction_type = 'love')
+              )
+              AND f.follower_id = ?
+        """, (user_id, user_id))
+    else:
+        # all users
+        shared_posts_res = query_db("""
+            SELECT DISTINCT r.post_id, r.user_id
+            FROM reactions r
+            WHERE (r.reaction_type = 'like' OR r.reaction_type = 'love')
+              AND r.post_id NOT IN (
+                  SELECT post_id
+                  FROM reactions
+                  WHERE user_id = ?
+                    AND (reaction_type = 'like' OR reaction_type = 'love')
+              )
+        """, (user_id,))
+    
+    recommended_post_ids = [post['post_id'] for post in shared_posts_res] if shared_posts_res else []
+
+    posts = query_db(f"""
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.id IN {tuple(recommended_post_ids)}
+        ORDER BY p.created_at DESC
+        LIMIT 5
+    """)
+
+    return posts
+
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -907,11 +962,93 @@ def user_risk_analysis(user_id):
             username: admin
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
-    """
-    
-    score = 0
+    """   
 
-    return score;
+    # Rule 2.1: Post & Comment Risk Score
+    # Step 1:
+    base_score = 0
+    user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    for post in user_posts:
+        _, post_risk_score = moderate_content(post['content'])
+        base_score += post_risk_score
+            
+    user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    for comment in user_comments:
+        _, comment_risk_score = moderate_content(comment['content'])
+        base_score += comment_risk_score
+
+    # Step 2:
+    account_age = 0
+    query_res = query_db('SELECT created_at FROM users WHERE user_id = ?', (user_id,))
+
+    if query_res and 'created_at' in query_res[0]:
+        created_time = query_res[0]['created_at']
+        created_time = datetime.datetime.strptime(created_time, "%Y-%m-%d %H:%M:%S")
+        current_time = datetime.datetime.now()
+        account_age = (current_time - created_time).days
+
+    # Step 3:
+    risk_score = 0
+    if account_age < 7:
+        risk_score = base_score * 1.5
+    else:
+        risk_score = base_score
+
+
+    # Rule 2.2: User Risk Score
+    # Step 1 (Profile Score): 
+    profile_score = 0
+    query_res = query_db('SELECT profile FROM users WHERE user_id = ?', (user_id,))
+
+    if query_res and 'profile' in query_res[0]:
+        profile_text = query_res[0]['profile']
+        _, profile_score = moderate_content(profile_text)
+    
+    # Step 2 (Post Score):
+    average_post_score = 0
+    posts_scores = []
+
+    for post in user_posts:
+        _, post_risk_score = moderate_content(post['content'])
+        posts_scores.append(post_risk_score)
+
+    if len(posts_scores) > 0:
+        average_post_score = np.mean(posts_scores)
+
+    # Step 3 (Comment Score): 
+    average_comment_score = 0
+    comments_scores = []
+
+    for comment in user_comments:
+        _, comment_risk_score = moderate_content(comment['content'])
+        comments_scores.append(comment_risk_score)
+
+    if len(comments_scores) > 0:
+        average_comment_score = np.mean(comments_scores)
+
+    # Step 4 (Combine Scores):
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    # Step 5 (Apply Age Multiplier):
+    if account_age < 7:
+        user_risk_score = content_risk_score * 1.5
+    elif account_age < 30:
+        user_risk_score = content_risk_score * 1.2
+    else:
+        user_risk_score = content_risk_score
+
+    # Step 6
+    query_res = query_db('SELECT birthdate FROM users WHERE user_id = ?', (user_id,))
+    birthdate = query_res[0]['birthdate'] if query_res else None
+    query_res = query_db('SELECT location FROM users WHERE user_id = ?', (user_id,))
+    location = query_res[0]['location'] if query_res else None
+
+    if (not birthdate) or (not profile_text or not profile_text.strip()) or (not location or not location.strip()):
+        user_risk_score += 0.5
+
+    user_risk_score = min(user_risk_score, 5.0)
+
+    return user_risk_score
 
     
 # Task 3.3
@@ -933,10 +1070,66 @@ def moderate_content(content):
     """
 
     moderated_content = content
+    original_content = content
     score = 0
-    
-    return moderated_content, score
 
+    #----- Stage 1.1: Severe Violation Checks -----
+    # Rule 1.1.1 (Tier 1 Words): 
+    TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    matches = re.findall(TIER1_PATTERN, original_content, flags=re.IGNORECASE)
+    if matches:
+        score = 5.0
+        moderated_content = "[content removed due to severe violation]"
+        return moderated_content, score
+
+    # Rule 1.1.2 (Tier 2 Phrases):
+    TIER2_PATTERN = '(' + '|'.join(TIER2_PHRASES) + ')'
+    matches = re.search(TIER2_PATTERN, original_content, flags=re.IGNORECASE)
+    if matches:
+        score = 5.0
+        moderated_content = "[content removed due to spam/scam policy] "
+        return moderated_content, score
+
+    #----- Stage 1.2: Scored Violations & Filtering -----
+    # Rule 1.2.1 (Tier 3 Words):
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    matches = re.findall(TIER3_PATTERN, original_content, flags=re.IGNORECASE)
+
+    score = len(matches) * 2
+    moderated_content = re.sub(TIER3_PATTERN, lambda m: '*' * len(m.group(0)), original_content, flags=re.IGNORECASE)
+
+    # Rule 1.2.2 (External Links):
+    URL_pattern = r"\b((?:https?://|www\d{0,3}[.]|[a-z0-9.\-]+[.][a-z]{2,4}/)(?:[^\s()<>]+|\(([^\s()<>]+|(\([^\s()<>]+\)))*\))+(?:\(([^\s()<>]+|(\([^\s()<>]+\)))*\)|[^\s`!()\[\]{};:'\".,<>?«»“”‘’]))"
+    matches = re.findall(URL_pattern, original_content, flags=re.IGNORECASE)        
+    
+    score = len(matches) * 2
+    moderated_content = re.sub(URL_pattern, lambda m: '[link removed]', moderated_content, flags=re.IGNORECASE)
+
+    # Rule 1.2.3 (Excessive Capitalization):
+    alpha_count = 0
+    upper_count = 0
+    for c in original_content:
+        if c.isalpha():
+            alpha_count += 1 
+            if c.isupper():
+                upper_count += 1
+
+    if alpha_count > 15 and ((upper_count / alpha_count) > 0.7):
+        score += 0.5
+
+    # Rule 1.2.4 (Personal Information):
+    phone_pattern = "\+?\d[\d\s().-]{6,}\d"
+    email_pattern = r'[\w.+-]+@[\w-]+\.[\w.-]+'
+
+    matches = re.findall(phone_pattern, moderated_content, flags=re.IGNORECASE)
+    score += len(matches) * 2
+    moderated_content = re.sub(phone_pattern, lambda m: '[personal information removed]', moderated_content, flags=re.IGNORECASE)
+
+    matches = re.findall(email_pattern, moderated_content, flags=re.IGNORECASE)
+    score += len(matches) * 2
+    moderated_content = re.sub(email_pattern, lambda m: '[personal information removed]', moderated_content, flags=re.IGNORECASE)
+
+    return moderated_content, score
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
